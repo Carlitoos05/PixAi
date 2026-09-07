@@ -28,6 +28,16 @@ Responde ÚNICAMENTE con JSON válido en este formato exacto:
 export const classifyPhoto = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => Input.parse(input))
   .handler(async ({ data }): Promise<ClassifyResult> => {
+    const start = Date.now();
+
+    console.log("PIXAI: función iniciada");
+
+    console.log(
+      "PIXAI: tamaño imagen:",
+      Math.round(data.imageBase64.length / 1024),
+      "KB",
+    );
+
     const geminiKey = process.env.GEMINI_API_KEY;
 
     if (!geminiKey) {
@@ -36,10 +46,12 @@ export const classifyPhoto = createServerFn({ method: "POST" })
       );
     }
 
-    const endpoint = 
+    const endpoint =
       "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
-    
-      const model = "gemini-3.5-flash-lite";
+
+    const model = "gemini-3.5-flash-lite";
+
+    console.log("PIXAI: enviando imagen a Gemini...");
 
     const res = await fetch(endpoint, {
       method: "POST",
@@ -50,33 +62,58 @@ export const classifyPhoto = createServerFn({ method: "POST" })
       body: JSON.stringify({
         model,
         messages: [
-          { role: "system", content: SYSTEM_PROMPT },
+          {
+            role: "system",
+            content: SYSTEM_PROMPT,
+          },
           {
             role: "user",
             content: [
-              { type: "text", text: "Analiza esta foto y responde solo con el JSON pedido." },
-              { type: "image_url", image_url: { url: data.imageBase64 } },
+              {
+                type: "text",
+                text: "Analiza esta foto y responde solo con el JSON pedido.",
+              },
+              {
+                type: "image_url",
+                image_url: {
+                  url: data.imageBase64,
+                },
+              },
             ],
           },
         ],
-        response_format: { type: "json_object" },
+        response_format: {
+          type: "json_object",
+        },
       }),
     });
 
+    console.log(
+      "PIXAI: Gemini respondió en:",
+      Date.now() - start,
+      "ms",
+    );
 
     if (res.status === 429) {
-      throw new Error("Límite de peticiones alcanzado. Espera un momento e intenta de nuevo.");
+      throw new Error(
+        "Límite de peticiones alcanzado. Espera un momento e intenta de nuevo.",
+      );
     }
-    
+
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`Error IA ${res.status}: ${text.slice(0, 200)}`);
+      throw new Error(
+        `Error IA ${res.status}: ${text.slice(0, 200)}`,
+      );
     }
 
     const json = await res.json();
-    const content: string = json.choices?.[0]?.message?.content ?? "{}";
+
+    const content: string =
+      json.choices?.[0]?.message?.content ?? "{}";
 
     let parsed: unknown;
+
     try {
       parsed = JSON.parse(content);
     } catch {
@@ -85,9 +122,21 @@ export const classifyPhoto = createServerFn({ method: "POST" })
     }
 
     const p = parsed as Partial<ClassifyResult>;
-    return {
+
+    const result: ClassifyResult = {
       isLabel: Boolean(p.isLabel),
       team: typeof p.team === "string" ? p.team.trim() : null,
-      category: typeof p.category === "string" ? p.category.trim() : null,
+      category:
+        typeof p.category === "string"
+          ? p.category.trim()
+          : null,
     };
+
+    console.log(
+      "PIXAI: tiempo total:",
+      Date.now() - start,
+      "ms",
+    );
+
+    return result;
   });
