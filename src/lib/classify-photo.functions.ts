@@ -28,25 +28,24 @@ Responde ÚNICAMENTE con JSON válido en este formato exacto:
 export const classifyPhoto = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => Input.parse(input))
   .handler(async ({ data }): Promise<ClassifyResult> => {
-    const lovableKey = process.env.LOVABLE_API_KEY;
     const geminiKey = process.env.GEMINI_API_KEY;
 
-    if (!lovableKey && !geminiKey) {
+    if (!geminiKey) {
       throw new Error(
-        "Falta la clave de IA. En local, añade GEMINI_API_KEY=... en tu archivo .env",
+        "Falta la clave de IA. Añade GEMINI_API_KEY en las variables de entorno",
       );
     }
 
-    const endpoint = lovableKey
-      ? "https://ai.gateway.lovable.dev/v1/chat/completions"
-      : "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
-    const model = lovableKey ? "google/gemini-3.1-flash-lite" : "gemini-3.5-flash-lite";
+    const endpoint = 
+      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+    
+      const model = "gemini-3.5-flash-lite";
 
     const res = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${lovableKey ?? geminiKey}`,
+        Authorization: `Bearer ${geminiKey}`,
       },
       body: JSON.stringify({
         model,
@@ -68,9 +67,7 @@ export const classifyPhoto = createServerFn({ method: "POST" })
     if (res.status === 429) {
       throw new Error("Límite de peticiones alcanzado. Espera un momento e intenta de nuevo.");
     }
-    if (res.status === 402) {
-      throw new Error("Sin créditos de IA. Añade créditos en tu workspace.");
-    }
+    
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Error IA ${res.status}: ${text.slice(0, 200)}`);
