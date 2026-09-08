@@ -242,7 +242,7 @@ function Index() {
     cancelRef.current = false;
     setProgress(0);
 
-    const CONCURRENCY = 4;
+    const CONCURRENCY = 8;
     const total = photos.length;
     let next = 0;
     let done = 0;
