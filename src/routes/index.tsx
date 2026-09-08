@@ -16,7 +16,7 @@ type JobRecord = {
   photos: number;
   teams: number;
   errors: number;
-  folders: string[];
+  folders: string[]; 
 };
 
 const HISTORY_KEY = "pixai_history";
@@ -74,20 +74,52 @@ async function fileToDownscaledDataUrl(file: File, maxDim = 512): Promise<string
 async function classifyWithRetry<T>(
   fn: () => Promise<T>,
   attempts = 3,
+  timeoutMs = 15000,
 ): Promise<T> {
   let lastErr: unknown;
+
   for (let i = 0; i < attempts; i++) {
     try {
-      return await fn();
+      const result = await Promise.race([
+        fn(),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => {
+            reject(
+              new Error(
+                `El análisis ha tardado más de ${timeoutMs / 1000} segundos.`,
+              ),
+            );
+          }, timeoutMs);
+        }),
+      ]);
+
+      return result;
     } catch (e) {
       lastErr = e;
+
       const msg = e instanceof Error ? e.message : "";
-      // Only rate limits and temporary server/network errors should be retried.
-      if (/Error IA 4\d\d|créditos|402/i.test(msg) && !/429/i.test(msg)) throw e;
-      await new Promise((r) => setTimeout(r, 500 * (i + 1) + Math.random() * 400));
+
+      // Errores definitivos: no tiene sentido reintentarlos.
+      if (
+        /Error IA 400|Error IA 401|Error IA 403|Error IA 404|402|Falta la clave/i.test(
+          msg,
+        )
+      ) {
+        throw e;
+      }
+
+      // Esperar un poco antes del siguiente intento.
+      if (i < attempts - 1) {
+        const delay = 700 * (i + 1) + Math.random() * 500;
+
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
     }
   }
-  throw lastErr;
+
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error("No se pudo analizar la foto.");
 }
 
 function cleanName(s: string) {
@@ -250,19 +282,42 @@ function Index() {
     const worker = async () => {
       while (true) {
         if (cancelRef.current) return;
+    
         const i = next++;
+    
         if (i >= total) return;
+    
         const p = photos[i];
-        setPhotos((prev) => prev.map((x) => (x.id === p.id ? { ...x, status: "processing" } : x)));
-
+    
+        setPhotos((prev) =>
+          prev.map((x) =>
+            x.id === p.id
+              ? {
+                  ...x,
+                  status: "processing",
+                  error: undefined,
+                }
+              : x,
+          ),
+        );
+    
         try {
           const dataUrl = await fileToDownscaledDataUrl(p.file);
-          const res: ClassifyResult = await classifyWithRetry(() =>
-            classify({ data: { imageBase64: dataUrl } }),
+    
+          const res: ClassifyResult = await classifyWithRetry(
+            () =>
+              classify({
+                data: {
+                  imageBase64: dataUrl,
+                },
+              }),
+            3,
+            15000,
           );
-
+    
           if (res.isLabel && res.team) {
             const category = res.category ?? "Sin_categoria";
+    
             setPhotos((prev) =>
               prev.map((x) =>
                 x.id === p.id
@@ -272,21 +327,45 @@ function Index() {
                       team: res.team!,
                       category,
                       groupKey: folderName(category, res.team!),
+                      error: undefined,
                     }
                   : x,
               ),
             );
           } else {
             setPhotos((prev) =>
-              prev.map((x) => (x.id === p.id ? { ...x, status: "photo" } : x)),
+              prev.map((x) =>
+                x.id === p.id
+                  ? {
+                      ...x,
+                      status: "photo",
+                      error: undefined,
+                    }
+                  : x,
+              ),
             );
           }
         } catch (err) {
-          const msg = err instanceof Error ? err.message : "Error";
+          const msg =
+            err instanceof Error
+              ? err.message
+              : "No se pudo analizar la foto.";
+    
+          console.error(`PIXAI: error en ${p.file.name}:`, msg);
+    
           setPhotos((prev) =>
-            prev.map((x) => (x.id === p.id ? { ...x, status: "error", error: msg } : x)),
+            prev.map((x) =>
+              x.id === p.id
+                ? {
+                    ...x,
+                    status: "error",
+                    error: msg,
+                  }
+                : x,
+            ),
           );
         }
+    
         done++;
         setProgress(done);
       }
