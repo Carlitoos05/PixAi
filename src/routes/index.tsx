@@ -156,9 +156,14 @@ function Index() {
   // Estado de operación: permite mostrar velocidad, tiempo estimado y modo de emergencia.
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [currentConcurrency, setCurrentConcurrency] = useState(MAX_CONCURRENCY);
+  type ServiceStatus = "normal" | "warning" | "error";
+  const [serviceStatus, setServiceStatus] = useState<ServiceStatus>("normal");
   const [serviceMessage, setServiceMessage] = useState(
     "IA operativa · velocidad normal",
   );
+  const [photosPerMinute, setPhotosPerMinute] = useState(0);
+  const progressRef = useRef(0);
+  const speedSamplesRef = useRef<Array<{ time: number; progress: number }>>([]);
 
 
   useEffect(() => {
@@ -171,9 +176,38 @@ function Index() {
   }, []);
 
   useEffect(() => {
+    progressRef.current = progress;
+  }, [progress]);
+
+  useEffect(() => {
     if (!running) return;
 
     const timer = window.setInterval(() => {
+      const now = Date.now();
+      const currentProgress = progressRef.current;
+      const windowMs = 15000;
+
+      speedSamplesRef.current.push({
+        time: now,
+        progress: currentProgress,
+      });
+
+      speedSamplesRef.current = speedSamplesRef.current.filter(
+        (sample) => now - sample.time <= windowMs,
+      );
+
+      const samples = speedSamplesRef.current;
+      if (samples.length >= 2) {
+        const first = samples[0];
+        const last = samples[samples.length - 1];
+        const elapsedMs = last.time - first.time;
+        const completed = Math.max(last.progress - first.progress, 0);
+
+        if (elapsedMs > 0) {
+          setPhotosPerMinute((completed / elapsedMs) * 60000);
+        }
+      }
+
       setElapsedSeconds((value) => value + 1);
     }, 1000);
 
@@ -308,7 +342,11 @@ function Index() {
     setRunning(true);
     cancelRef.current = false;
     setElapsedSeconds(0);
+    setPhotosPerMinute(0);
+    progressRef.current = 0;
+    speedSamplesRef.current = [];
     setCurrentConcurrency(MAX_CONCURRENCY);
+    setServiceStatus("normal");
     setServiceMessage("IA operativa · velocidad normal");
 
     if (retryErrorsOnly) {
@@ -336,6 +374,7 @@ function Index() {
     // Así podemos reducir la concurrencia automáticamente cuando Gemini limita.
     let activeConcurrency = MAX_CONCURRENCY;
     let successStreak = 0;
+    let consecutiveCriticalErrors = 0;
 
     const waitForSlot = async (workerId: number) => {
       while (!cancelRef.current && workerId >= activeConcurrency) {
@@ -355,13 +394,15 @@ function Index() {
         setCurrentConcurrency(nextConcurrency);
       }
 
+      setServiceStatus("warning");
       setServiceMessage(
-        `⚠️ Alta demanda · reduciendo temporalmente a ${activeConcurrency} procesos`,
+        `IA bajo demanda · reduciendo velocidad (${activeConcurrency}/${MAX_CONCURRENCY})`,
       );
     };
 
     const registerSuccess = () => {
       successStreak++;
+      consecutiveCriticalErrors = 0;
 
       // Tras suficientes éxitos consecutivos recuperamos poco a poco la velocidad.
       if (successStreak >= 12 && activeConcurrency < MAX_CONCURRENCY) {
@@ -373,10 +414,12 @@ function Index() {
         setCurrentConcurrency(activeConcurrency);
 
         if (activeConcurrency === MAX_CONCURRENCY) {
-          setServiceMessage("🟢 Servicio estable · velocidad normal");
+          setServiceStatus("normal");
+          setServiceMessage("IA operativa · velocidad normal");
         } else {
+          setServiceStatus("warning");
           setServiceMessage(
-            `🟢 Servicio estable · recuperando velocidad (${activeConcurrency}/${MAX_CONCURRENCY})`,
+            `IA estabilizando · recuperando velocidad (${activeConcurrency}/${MAX_CONCURRENCY})`,
           );
         }
       }
@@ -464,7 +507,20 @@ function Index() {
             );
 
           if (temporaryPressure) {
+            // Una limitación temporal de Gemini sí afecta al servicio global:
+            // reducimos concurrencia y mostramos estado amarillo.
             registerTemporaryPressure();
+          } else {
+            // Un error de una sola foto NO significa que la IA esté caída.
+            // Los errores se muestran en la lista y pueden reintentarse aparte.
+            // Solo pasamos a rojo después de varios fallos críticos consecutivos,
+            // lo que evita alarmas por una foto puntual.
+            consecutiveCriticalErrors++;
+
+            if (consecutiveCriticalErrors >= 3) {
+              setServiceStatus("error");
+              setServiceMessage("IA con problemas · varios intentos fallidos");
+            }
           }
 
           console.error(`PIXAI: error en ${p.file.name}:`, msg);
@@ -497,7 +553,8 @@ function Index() {
     setRunning(false);
 
     if (!cancelRef.current) {
-      setServiceMessage("🟢 Procesamiento terminado");
+      setServiceStatus("normal");
+      setServiceMessage("IA operativa · velocidad normal");
     }
   };
 
@@ -509,7 +566,11 @@ function Index() {
     setPhotos([]);
     setProgress(0);
     setElapsedSeconds(0);
+    setPhotosPerMinute(0);
+    progressRef.current = 0;
+    speedSamplesRef.current = [];
     setCurrentConcurrency(MAX_CONCURRENCY);
+    setServiceStatus("normal");
     setServiceMessage("IA operativa · velocidad normal");
   };
 
@@ -615,8 +676,6 @@ function Index() {
   const done = progress === photos.length && photos.length > 0;
 
   const elapsedMinutes = elapsedSeconds / 60;
-  const photosPerMinute =
-    elapsedMinutes > 0 ? progress / elapsedMinutes : 0;
   const remainingPhotos = Math.max(photos.length - progress, 0);
   const etaMinutes =
     photosPerMinute > 0 ? remainingPhotos / photosPerMinute : 0;
@@ -867,7 +926,9 @@ function Index() {
                     <p className="mt-1 text-sm font-semibold">
                       {photosPerMinute > 0
                         ? `${Math.round(photosPerMinute).toLocaleString("es-ES")} fotos/min`
-                        : "Calculando…"}
+                        : progress > 0
+                          ? "Calculando…"
+                          : "Preparando…"}
                     </p>
                   </div>
                   <div className="rounded-lg border border-border bg-background/50 p-3">
@@ -885,20 +946,45 @@ function Index() {
                   <div className="rounded-lg border border-border bg-background/50 p-3">
                     <p className="text-xs text-muted-foreground">Procesos IA</p>
                     <p className="mt-1 text-sm font-semibold">
-                      {currentConcurrency}/{MAX_CONCURRENCY}
+                      {currentConcurrency}/{MAX_CONCURRENCY} activos
                     </p>
                   </div>
                 </div>
 
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs">
-                  <span className={errors > 0 ? "text-destructive" : "text-muted-foreground"}>
+                  <span className={errors > 0 ? "font-medium text-destructive" : "text-muted-foreground"}>
                     {errors > 0
-                      ? `⚠️ ${errors} fotos necesitan revisión o reintento`
-                      : "✅ Sin errores detectados"}
+                      ? `🔴 ${errors} ${errors === 1 ? "error" : "errores"} · puedes reintentar`
+                      : "🟢 Sin errores detectados"}
                   </span>
-                  <span className="text-muted-foreground">
-                    {running ? serviceMessage : `Tiempo: ${formatDuration(elapsedMinutes)}`}
-                  </span>
+                  {running ? (
+                    <span
+                      className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 font-medium transition-colors ${
+                        serviceStatus === "normal"
+                          ? "bg-success/15 text-success"
+                          : serviceStatus === "warning"
+                            ? "bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                            : "bg-destructive/15 text-destructive"
+                      }`}
+                    >
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          serviceStatus === "normal"
+                            ? "bg-success"
+                            : serviceStatus === "warning"
+                              ? "bg-amber-500"
+                              : "bg-destructive"
+                        }`}
+                      />
+                      {serviceMessage}
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">
+                      {done
+                        ? `Tiempo total: ${formatDuration(elapsedMinutes)}`
+                        : `Tiempo: ${formatDuration(elapsedMinutes)}`}
+                    </span>
+                  )}
                 </div>
               </div>
             )}
