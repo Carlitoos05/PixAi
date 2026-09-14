@@ -25,6 +25,8 @@ Si NO es una etiqueta (foto de jugadores, equipo, paisaje, etc.) devuelve isLabe
 Responde ÚNICAMENTE con JSON válido en este formato exacto:
 {"isLabel": true|false, "team": "..."|null, "category": "..."|null}`;
 
+const GEMINI_TIMEOUT_MS = 15000;
+
 export const classifyPhoto = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) => Input.parse(input))
   .handler(async ({ data }): Promise<ClassifyResult> => {
@@ -53,40 +55,82 @@ export const classifyPhoto = createServerFn({ method: "POST" })
 
     console.log("PIXAI: enviando imagen a Gemini...");
 
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${geminiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          {
-            role: "system",
-            content: SYSTEM_PROMPT,
-          },
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: "Analiza esta foto y responde solo con el JSON pedido.",
-              },
-              {
-                type: "image_url",
-                image_url: {
-                  url: data.imageBase64,
-                },
-              },
-            ],
-          },
-        ],
-        response_format: {
-          type: "json_object",
+    /*
+     * IMPORTANTE:
+     * Este AbortController cancela REALMENTE la petición HTTP
+     * si Gemini tarda demasiado.
+     *
+     * Antes solamente teníamos un timeout en el navegador,
+     * pero la petición podía seguir ejecutándose en Vercel.
+     */
+    const controller = new AbortController();
+
+    const timeout = setTimeout(() => {
+      controller.abort();
+    }, GEMINI_TIMEOUT_MS);
+
+    let res: Response;
+
+    try {
+      res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${geminiKey}`,
         },
-      }),
-    });
+        signal: controller.signal,
+        body: JSON.stringify({
+          model,
+          messages: [
+            {
+              role: "system",
+              content: SYSTEM_PROMPT,
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: "Analiza esta foto y responde solo con el JSON pedido.",
+                },
+                {
+                  type: "image_url",
+                  image_url: {
+                    url: data.imageBase64,
+                  },
+                },
+              ],
+            },
+          ],
+          response_format: {
+            type: "json_object",
+          },
+        }),
+      });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        console.error(
+          "PIXAI: Gemini superó el timeout de",
+          GEMINI_TIMEOUT_MS,
+          "ms",
+        );
+
+        throw new Error(
+          "Gemini ha tardado demasiado en responder. Reintentando...",
+        );
+      }
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Error de conexión con Gemini.";
+
+      console.error("PIXAI: error de conexión:", message);
+
+      throw new Error(`Error de conexión con Gemini: ${message}`);
+    } finally {
+      clearTimeout(timeout);
+    }
 
     console.log(
       "PIXAI: Gemini respondió en:",
@@ -94,14 +138,52 @@ export const classifyPhoto = createServerFn({ method: "POST" })
       "ms",
     );
 
+    /*
+     * Rate limit de Gemini.
+     * El cliente se encargará de reintentar.
+     */
     if (res.status === 429) {
+      console.warn("PIXAI: Gemini devolvió 429");
+
       throw new Error(
-        "Límite de peticiones alcanzado. Espera un momento e intenta de nuevo.",
+        "Límite de peticiones alcanzado. Reintentando...",
       );
     }
 
+    /*
+     * Errores temporales del servidor de Gemini.
+     * También se pueden reintentar desde el cliente.
+     */
+    if (
+      res.status === 408 ||
+      res.status === 425 ||
+      res.status === 500 ||
+      res.status === 502 ||
+      res.status === 503 ||
+      res.status === 504
+    ) {
+      console.warn(
+        "PIXAI: error temporal de Gemini:",
+        res.status,
+      );
+
+      throw new Error(
+        `Error temporal de Gemini ${res.status}. Reintentando...`,
+      );
+    }
+
+    /*
+     * Errores definitivos.
+     */
     if (!res.ok) {
       const text = await res.text();
+
+      console.error(
+        "PIXAI: error Gemini:",
+        res.status,
+        text.slice(0, 300),
+      );
+
       throw new Error(
         `Error IA ${res.status}: ${text.slice(0, 200)}`,
       );
@@ -118,7 +200,16 @@ export const classifyPhoto = createServerFn({ method: "POST" })
       parsed = JSON.parse(content);
     } catch {
       const match = content.match(/\{[\s\S]*\}/);
-      parsed = match ? JSON.parse(match[0]) : {};
+
+      if (match) {
+        try {
+          parsed = JSON.parse(match[0]);
+        } catch {
+          parsed = {};
+        }
+      } else {
+        parsed = {};
+      }
     }
 
     const p = parsed as Partial<ClassifyResult>;
