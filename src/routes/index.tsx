@@ -73,7 +73,7 @@ async function fileToDownscaledDataUrl(file: File, maxDim = 512): Promise<string
 
 async function classifyWithRetry<T>(
   fn: () => Promise<T>,
-  attempts = 3,
+  attempts = 4,
   timeoutMs = 15000,
 ): Promise<T> {
   let lastErr: unknown;
@@ -108,9 +108,13 @@ async function classifyWithRetry<T>(
         throw e;
       }
 
-      // Esperar un poco antes del siguiente intento.
+      // Backoff progresivo. Los 429/errores temporales esperan más.
       if (i < attempts - 1) {
-        const delay = 700 * (i + 1) + Math.random() * 500;
+        const isRateLimited =
+          /429|límite de peticiones|rate limit|resource_exhausted/i.test(msg);
+        const baseDelay = isRateLimited ? 1800 : 700;
+        const delay =
+          baseDelay * Math.pow(2, i) + Math.random() * 700;
 
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
@@ -121,6 +125,9 @@ async function classifyWithRetry<T>(
     ? lastErr
     : new Error("No se pudo analizar la foto.");
 }
+
+const MAX_CONCURRENCY = 12;
+const MIN_CONCURRENCY = 4;
 
 function cleanName(s: string) {
   return s
@@ -146,6 +153,13 @@ function Index() {
   const [showHelp, setShowHelp] = useState(false);
   const [photographer, setPhotographer] = useState("");
 
+  // Estado de operación: permite mostrar velocidad, tiempo estimado y modo de emergencia.
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [currentConcurrency, setCurrentConcurrency] = useState(MAX_CONCURRENCY);
+  const [serviceMessage, setServiceMessage] = useState(
+    "IA operativa · velocidad normal",
+  );
+
 
   useEffect(() => {
     try {
@@ -155,6 +169,16 @@ function Index() {
       /* ignore */
     }
   }, []);
+
+  useEffect(() => {
+    if (!running) return;
+
+    const timer = window.setInterval(() => {
+      setElapsedSeconds((value) => value + 1);
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [running]);
 
   const saveHistory = useCallback((rec: JobRecord) => {
     setHistory((prev) => {
@@ -268,27 +292,108 @@ function Index() {
     return n;
   }, [photos]);
 
-  const start = async () => {
+  const start = async (retryErrorsOnly = false) => {
     if (!photos.length || running) return;
+
+    const queue = photos
+      .map((photo, index) => ({ photo, index }))
+      .filter(({ photo }) =>
+        retryErrorsOnly
+          ? photo.status === "error"
+          : photo.status === "pending" || photo.status === "processing",
+      );
+
+    if (!queue.length) return;
+
     setRunning(true);
     cancelRef.current = false;
-    setProgress(0);
+    setElapsedSeconds(0);
+    setCurrentConcurrency(MAX_CONCURRENCY);
+    setServiceMessage("IA operativa · velocidad normal");
 
-    const CONCURRENCY = 12;
-    const total = photos.length;
+    if (retryErrorsOnly) {
+      const errorIds = new Set(queue.map(({ photo }) => photo.id));
+      setPhotos((prev) =>
+        prev.map((photo) =>
+          errorIds.has(photo.id)
+            ? { ...photo, status: "pending", error: undefined }
+            : photo,
+        ),
+      );
+    } else {
+      setProgress(0);
+    }
+
     let next = 0;
-    let done = 0;
+    let completedThisRun = 0;
+    const completedBefore = photos.filter(
+      (photo) => photo.status === "label" || photo.status === "photo",
+    ).length;
 
-    const worker = async () => {
+    setProgress(completedBefore);
+
+    // Todos los workers existen, pero solo los necesarios pueden tomar trabajo.
+    // Así podemos reducir la concurrencia automáticamente cuando Gemini limita.
+    let activeConcurrency = MAX_CONCURRENCY;
+    let successStreak = 0;
+
+    const waitForSlot = async (workerId: number) => {
+      while (!cancelRef.current && workerId >= activeConcurrency) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    };
+
+    const registerTemporaryPressure = () => {
+      successStreak = 0;
+      const nextConcurrency = Math.max(
+        MIN_CONCURRENCY,
+        activeConcurrency - 2,
+      );
+
+      if (nextConcurrency !== activeConcurrency) {
+        activeConcurrency = nextConcurrency;
+        setCurrentConcurrency(nextConcurrency);
+      }
+
+      setServiceMessage(
+        `⚠️ Alta demanda · reduciendo temporalmente a ${activeConcurrency} procesos`,
+      );
+    };
+
+    const registerSuccess = () => {
+      successStreak++;
+
+      // Tras suficientes éxitos consecutivos recuperamos poco a poco la velocidad.
+      if (successStreak >= 12 && activeConcurrency < MAX_CONCURRENCY) {
+        activeConcurrency = Math.min(
+          MAX_CONCURRENCY,
+          activeConcurrency + 1,
+        );
+        successStreak = 0;
+        setCurrentConcurrency(activeConcurrency);
+
+        if (activeConcurrency === MAX_CONCURRENCY) {
+          setServiceMessage("🟢 Servicio estable · velocidad normal");
+        } else {
+          setServiceMessage(
+            `🟢 Servicio estable · recuperando velocidad (${activeConcurrency}/${MAX_CONCURRENCY})`,
+          );
+        }
+      }
+    };
+
+    const worker = async (workerId: number) => {
       while (true) {
         if (cancelRef.current) return;
-    
-        const i = next++;
-    
-        if (i >= total) return;
-    
-        const p = photos[i];
-    
+
+        await waitForSlot(workerId);
+        if (cancelRef.current) return;
+
+        const item = queue[next++];
+        if (!item) return;
+
+        const { photo: p } = item;
+
         setPhotos((prev) =>
           prev.map((x) =>
             x.id === p.id
@@ -300,10 +405,10 @@ function Index() {
               : x,
           ),
         );
-    
+
         try {
           const dataUrl = await fileToDownscaledDataUrl(p.file);
-    
+
           const res: ClassifyResult = await classifyWithRetry(
             () =>
               classify({
@@ -311,13 +416,15 @@ function Index() {
                   imageBase64: dataUrl,
                 },
               }),
-            3,
+            4,
             15000,
           );
-    
+
+          registerSuccess();
+
           if (res.isLabel && res.team) {
             const category = res.category ?? "Sin_categoria";
-    
+
             setPhotos((prev) =>
               prev.map((x) =>
                 x.id === p.id
@@ -350,9 +457,18 @@ function Index() {
             err instanceof Error
               ? err.message
               : "No se pudo analizar la foto.";
-    
+
+          const temporaryPressure =
+            /429|límite de peticiones|rate limit|resource_exhausted|Error temporal de Gemini|503|502|504/i.test(
+              msg,
+            );
+
+          if (temporaryPressure) {
+            registerTemporaryPressure();
+          }
+
           console.error(`PIXAI: error en ${p.file.name}:`, msg);
-    
+
           setPhotos((prev) =>
             prev.map((x) =>
               x.id === p.id
@@ -365,16 +481,24 @@ function Index() {
             ),
           );
         }
-    
-        done++;
-        setProgress(done);
+
+        completedThisRun++;
+        setProgress(completedBefore + completedThisRun);
       }
     };
 
     await Promise.all(
-      Array.from({ length: Math.min(CONCURRENCY, total) }, () => worker()),
+      Array.from(
+        { length: Math.min(MAX_CONCURRENCY, queue.length) },
+        (_, workerId) => worker(workerId),
+      ),
     );
+
     setRunning(false);
+
+    if (!cancelRef.current) {
+      setServiceMessage("🟢 Procesamiento terminado");
+    }
   };
 
   const stop = () => {
@@ -384,6 +508,9 @@ function Index() {
   const reset = () => {
     setPhotos([]);
     setProgress(0);
+    setElapsedSeconds(0);
+    setCurrentConcurrency(MAX_CONCURRENCY);
+    setServiceMessage("IA operativa · velocidad normal");
   };
 
   const downloadZip = async () => {
@@ -482,7 +609,27 @@ function Index() {
 
   const labelsFound = photos.filter((p) => p.status === "label").length;
   const errors = photos.filter((p) => p.status === "error").length;
+  const pending = photos.filter(
+    (p) => p.status === "pending" || p.status === "processing",
+  ).length;
   const done = progress === photos.length && photos.length > 0;
+
+  const elapsedMinutes = elapsedSeconds / 60;
+  const photosPerMinute =
+    elapsedMinutes > 0 ? progress / elapsedMinutes : 0;
+  const remainingPhotos = Math.max(photos.length - progress, 0);
+  const etaMinutes =
+    photosPerMinute > 0 ? remainingPhotos / photosPerMinute : 0;
+
+  const formatDuration = (minutes: number) => {
+    if (!Number.isFinite(minutes) || minutes <= 0) return "—";
+    if (minutes < 1) return "<1 min";
+    const rounded = Math.ceil(minutes);
+    if (rounded < 60) return `${rounded} min`;
+    const hours = Math.floor(rounded / 60);
+    const mins = rounded % 60;
+    return mins ? `${hours} h ${mins} min` : `${hours} h`;
+  };
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -644,10 +791,19 @@ function Index() {
               <div className="flex flex-wrap items-center gap-2">
                 {!running && !done && (
                   <button
-                    onClick={start}
+                    onClick={() => start(false)}
                     className="rounded-lg bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground transition hover:opacity-90"
                   >
                     Procesar con IA
+                  </button>
+                )}
+                {!running && errors > 0 && (
+                  <button
+                    onClick={() => start(true)}
+                    className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-2.5 text-sm font-semibold text-destructive transition hover:bg-destructive/15"
+                  >
+                    <AlertCircle className="h-4 w-4" />
+                    Reintentar {errors} {errors === 1 ? "error" : "errores"}
                   </button>
                 )}
                 {running && (
@@ -683,20 +839,66 @@ function Index() {
             </div>
 
             {(running || done) && (
-              <div className="rounded-lg border border-border bg-card p-4">
-                <div className="mb-2 flex items-center justify-between text-sm">
+              <div className="rounded-xl border border-border bg-card p-5">
+                <div className="mb-3 flex items-center justify-between gap-4 text-sm">
                   <span className="font-medium">
-                    {done ? "Completado" : "Procesando..."}
+                    {done ? "Procesamiento completado" : "Procesando torneo"}
                   </span>
                   <span className="text-muted-foreground">
-                    {progress} / {photos.length}
+                    {progress.toLocaleString("es-ES")} / {photos.length.toLocaleString("es-ES")}
                   </span>
                 </div>
+
                 <div className="h-2 overflow-hidden rounded-full bg-secondary">
                   <div
                     className="h-full bg-primary transition-all"
-                    style={{ width: `${(progress / photos.length) * 100}%` }}
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        (progress / photos.length) * 100,
+                      )}%`,
+                    }}
                   />
+                </div>
+
+                <div className="mt-4 grid gap-3 sm:grid-cols-4">
+                  <div className="rounded-lg border border-border bg-background/50 p-3">
+                    <p className="text-xs text-muted-foreground">Velocidad</p>
+                    <p className="mt-1 text-sm font-semibold">
+                      {photosPerMinute > 0
+                        ? `${Math.round(photosPerMinute).toLocaleString("es-ES")} fotos/min`
+                        : "Calculando…"}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/50 p-3">
+                    <p className="text-xs text-muted-foreground">Tiempo restante</p>
+                    <p className="mt-1 text-sm font-semibold">
+                      {done ? "Terminado" : formatDuration(etaMinutes)}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/50 p-3">
+                    <p className="text-xs text-muted-foreground">Pendientes</p>
+                    <p className="mt-1 text-sm font-semibold">
+                      {pending.toLocaleString("es-ES")}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/50 p-3">
+                    <p className="text-xs text-muted-foreground">Procesos IA</p>
+                    <p className="mt-1 text-sm font-semibold">
+                      {currentConcurrency}/{MAX_CONCURRENCY}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span className={errors > 0 ? "text-destructive" : "text-muted-foreground"}>
+                    {errors > 0
+                      ? `⚠️ ${errors} fotos necesitan revisión o reintento`
+                      : "✅ Sin errores detectados"}
+                  </span>
+                  <span className="text-muted-foreground">
+                    {running ? serviceMessage : `Tiempo: ${formatDuration(elapsedMinutes)}`}
+                  </span>
                 </div>
               </div>
             )}
