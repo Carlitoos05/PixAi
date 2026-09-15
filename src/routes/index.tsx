@@ -26,13 +26,13 @@ const HISTORY_KEY = "pixai_history";
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "PixAi · Organiza fotos de torneo por equipo con IA" },
+      { title: "Elevent Studio" },
       {
         name: "description",
         content:
           "Sube las fotos de un fotógrafo, la IA detecta las etiquetas y agrupa cada equipo en su carpeta. Descarga un ZIP listo.",
       },
-      { property: "og:title", content: "PixAi · Organiza fotos por equipo" },
+      { property: "og:title", content: "Elevent Studio · Organiza fotos por equipo" },
       {
         property: "og:description",
         content: "Clasifica automáticamente las fotos de un torneo por equipo y descarga las carpetas en un ZIP.",
@@ -699,7 +699,7 @@ function Index() {
               <Camera className="h-4 w-4" strokeWidth={2} />
             </div>
             <div>
-              <h1 className="text-[15px] font-semibold tracking-tight">PixAi</h1>
+              <h1 className="text-[15px] font-semibold tracking-tight">Elevent Studio</h1>
               <p className="text-xs text-muted-foreground">
                 Fotos de torneo, ordenadas por equipo
               </p>
